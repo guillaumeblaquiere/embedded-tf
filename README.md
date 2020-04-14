@@ -11,21 +11,27 @@ The container exposes a web server which, on each request:
 
 * Downloads the model to use from GCS bucket
 * Starts a Tensorflow server with the loaded model
-* Downloads the input file(s) to predict from GCS bucket
-* Submits the inputs and store the predictions
-* Uploads the prediction file(s) to GCS bucket
-* Kill Tensorflow server and clean the local data  
+* For each input file
+  * Download the input file in memory
+  * Format the input file in the Tensorflow server expected JSON format
+  * Perform the prediction and get the body response
+  * Format the body response for having a JSON line output
+  * Upload the output into the bucket/path output
+* Kill Tensorflow server and clean the local data
+
+The output file hierarchy follows the input file hierarchy  
 
 ## Caveats
 
 ### Memory size
 The container stores the files in `/tmp` directory. 
 
-On managed Cloud Run, it's an in-memory file system. Take care of the memory footprint of
-* The files (model, input and output) 
-* The app (web server, tensorflow server, request and response memory size)
+On managed Cloud Run, it's an in-memory file system. Take care of the memory footprint:
+* The model files are stored in `/tmp` directory (in-memory file system).
+* The input and output file content are kept in a variable in memory.
+* The app, including the Go web server, the ephemeral Tensorflow server which its request and its response has impact on memory.
  
- It mustn't exceed the total memory allowed on the service (max 2Gb with Cloud Run managed).
+It mustn't exceed the total memory allowed on the service (max 2Gb with Cloud Run managed).
 
 ### Concurrency
 The container is able to handle only one request at the time (because of previous point). 

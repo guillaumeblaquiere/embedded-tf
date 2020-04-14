@@ -16,17 +16,25 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 )
 
-type tfAnswer struct {
+//JSON response of Tensorflow server. Contain predictions or error.
+type outputPredictions struct {
 	Prediction []interface{} `json:"predictions"`
 	Error      string        `json:"error"`
 }
-type inputPrediction struct {
+
+//JSON representation of Instance for Prediction
+type inputPredictions struct {
 	Instances []interface{} `json:"instances"`
+}
+
+//FilePath represent the file name and it's relative path
+type filePath struct {
+	RelativePath string
+	FileName     string
 }
 
 const (
@@ -36,11 +44,6 @@ const (
 	LOCAL_MODEL_PATH = "/tmp/model/"
 	//Number of the model. Required by Tensorflow. The value doesn't matter here
 	MODEL_DUMMY_VERSION = "000000/"
-
-	//Local storage of the input file(s)
-	LOCAL_INPUT_PATH = "/tmp/input/"
-	//Local storage of the prediction output file(s)
-	LOCAL_OUTPUT_PATH = "/tmp/output/"
 
 	//The prefix of a GCS bucket definition
 	BUCKET_PREFIX = "gs://"
@@ -64,6 +67,18 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+
+	//Create the storage client
+	ctx := context.Background()
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	//Download model
+	fmt.Println(downloadFiles(ctx, client.Bucket("gib-datascience"), "consumptionsH/rnn/1/export/exporter/1546446862/saved_model.pb", ".\\000000\\"))
+
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%s", port), router))
 }
 
@@ -129,8 +144,6 @@ func LoadAndPredict(w http.ResponseWriter, r *http.Request) {
 
 	// Clear the previous execution
 	os.RemoveAll(LOCAL_MODEL_PATH)
-	os.RemoveAll(LOCAL_INPUT_PATH)
-	os.RemoveAll(LOCAL_OUTPUT_PATH)
 
 	//Create the storage client
 	ctx := context.Background()
@@ -168,43 +181,12 @@ func LoadAndPredict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Download input
-	// Copy a full directory if finish by /, else only the file
-	if strings.HasSuffix(pathInput, "/") {
-		//Copy all files and subdir
-		err = downloadFiles(ctx, client.Bucket(bucketInput), pathInput, LOCAL_INPUT_PATH)
-	} else {
-		// Copy only the provided file name
-		// Get the file name
-		n := pathInput[strings.LastIndex(pathInput, "/")+1:]
-		// Create the directory
-		os.MkdirAll(LOCAL_INPUT_PATH, 0755)
-		err = downloadFile(ctx, client.Bucket(bucketInput), pathInput, LOCAL_INPUT_PATH+n)
-	}
-	if err != nil {
+	if err = makePredictions(ctx, client.Bucket(bucketInput), pathInput, client.Bucket(bucketOutput), pathOutput); err != nil {
 		log.Println(err)
 		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, "error when downloading input files")
+		fmt.Fprintln(w, "error when making predictions")
 		return
 	}
-
-	log.Println("input loaded to " + LOCAL_INPUT_PATH)
-
-	//Make the prediction with the inputs
-	err = makePredictions(LOCAL_INPUT_PATH, LOCAL_OUTPUT_PATH)
-	if err != nil {
-		log.Println(err)
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintln(w, "error during predictions")
-		return
-	}
-
-	log.Println("Predictions done")
-
-	// Upload file to storage
-	err = uploadFile(ctx, client.Bucket(bucketOutput), pathOutput, LOCAL_OUTPUT_PATH)
-
-	log.Println("output uploaded")
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "predictions completed")
@@ -277,97 +259,69 @@ func copyAndCapture(w io.Writer, r io.Reader) ([]byte, error) {
 	}
 }
 
-//Upload file from localPath into the path of the bucket. The bucket path must be a directory.
-//All the files and subdirectory in the localPath are uploaded
-func uploadFile(ctx context.Context, bucket *storage.BucketHandle, path string, localPath string) error {
-	if !strings.HasSuffix(path, "/") {
-		path += "/"
-	}
+//Perform the prediction file by file. The output folder hierarchy respect the input one.
+//One file is processed at the time to limit the memory usage
+func makePredictions(ctx context.Context, inputBucket *storage.BucketHandle, inputPath string, outputBucket *storage.BucketHandle, outputPath string) error {
 
-	list, err := ioutil.ReadDir(localPath)
+	// Get inputs of input file
+	inputs, err := listGcsFiles(ctx, inputBucket, inputPath)
 	if err != nil {
 		return err
 	}
 
-	for _, file := range list {
-		if file.IsDir() {
-			err = uploadFile(ctx, bucket, path+file.Name()+"/", localPath+file.Name()+string(filepath.Separator))
-			if err != nil {
-				return err
-			}
-		} else {
-			f, err := os.Open(localPath + file.Name())
-			if err != nil {
-				return err
-			}
-			defer f.Close()
+	//Get the root path of the input.
+	rootInputPath := inputPath[:strings.LastIndex(inputPath, "/")+1]
 
-			w := bucket.Object(path + file.Name()).NewWriter(ctx)
-			if _, err = io.Copy(w, f); err != nil {
-				return err
-			}
-			if err := w.Close(); err != nil {
-				return err
-			}
+	//Make sure that ourput is a directory
+	if !strings.HasSuffix(outputPath, "/") {
+		outputPath += "/"
+	}
+
+	for _, input := range inputs {
+		//Execute the prediction on each input. Extracted function for preventing memory leaks (defer in loop for)
+		if err = executePrediction(ctx, inputBucket, rootInputPath, outputBucket, outputPath, input); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-//Request the prediction to Tensorflow server. Submit each file and subdirectory into inputPath
-//and store the prediction into the outputPath, with the same folder structure as the inputPath
-//The output file name have the same name as the input with predictions_ as prefix
-func makePredictions(inputPath string, outputPath string) error {
-	list, err := ioutil.ReadDir(inputPath)
+//Execute the prediction on each input file.
+func executePrediction(ctx context.Context, inputBucket *storage.BucketHandle, rootInputPath string, outputBucket *storage.BucketHandle, outputPath string, input filePath) error {
+	//Read the input file
+	src, err := inputBucket.Object(rootInputPath + input.RelativePath + input.FileName).NewReader(ctx)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	// Prepare the input
+	finput, err := formatInput(src)
 	if err != nil {
 		return err
 	}
 
-	// Make directory is required
-	os.MkdirAll(outputPath, 0755)
-
-	//Iterate over files
-	for _, file := range list {
-		if file.IsDir() {
-			err = makePredictions(inputPath+file.Name()+string(filepath.Separator),
-				outputPath+file.Name()+string(filepath.Separator))
-			if err != nil {
-				return err
-			}
-		} else {
-			// Format input
-			f, err := os.Open(inputPath + file.Name())
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-
-			finput, err := formatInput(f)
-			if err != nil {
-				return err
-			}
-
-			// Call TF for prediction
-			resp, err := http.Post(TF_URL, TF_CONTENT_TYPE, strings.NewReader(finput))
-			if err != nil {
-				return err
-			}
-
-			// Write the output
-			foutput, err := formatOutput(resp.Body)
-			if err != nil {
-				return err
-			}
-
-			o, err := os.Create(outputPath + OUTPUT_PREFIX + file.Name())
-			if err != nil {
-				return err
-			}
-			defer o.Close()
-
-			_, err = io.Copy(o, strings.NewReader(foutput))
-		}
+	// Make prediction
+	resp, err := http.Post(TF_URL, TF_CONTENT_TYPE, strings.NewReader(finput))
+	if err != nil {
+		return err
 	}
+
+	//Format the output
+	foutput, err := formatOutput(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	// Upload the prediction
+	w := outputBucket.Object(outputPath + input.RelativePath + input.FileName).NewWriter(ctx)
+	if _, err = io.Copy(w, strings.NewReader(foutput)); err != nil {
+		return err
+	}
+	if err := w.Close(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -383,7 +337,7 @@ func formatOutput(input io.Reader) (string, error) {
 	output = bytes.ReplaceAll(output, []byte("\\"), []byte("\\\\"))
 
 	//Unmarshal the prediction JSON
-	answer := tfAnswer{}
+	answer := outputPredictions{}
 	err = json.Unmarshal(output, &answer)
 	if err != nil {
 		log.Printf("Error during answer unmarshal %s\n", output)
@@ -409,7 +363,7 @@ func formatOutput(input io.Reader) (string, error) {
 //Get the JSON line as input and format it as expected by Tensorflow server:
 //Encapsulate the JSON line into a "intances" JSON array
 func formatInput(input io.Reader) (string, error) {
-	i := inputPrediction{Instances: []interface{}{}}
+	i := inputPredictions{Instances: []interface{}{}}
 	scanner := bufio.NewScanner(input)
 	for scanner.Scan() {
 		var o interface{}
@@ -439,19 +393,10 @@ func extractLocation(location string) (string, string, error) {
 	return s[0], s[1], nil
 }
 
-//Download files from storage to the localDest. If there is subdirectory into GCS path, a loop is performed for getting
-//subdirectories
-//The path must represent a GCS directory (prefix)
-func downloadFiles(ctx context.Context, bucket *storage.BucketHandle, path string, localDest string) error {
+//List all the file with their name and relative path in a given bucket and path
+func listGcsFiles(ctx context.Context, bucket *storage.BucketHandle, path string) ([]filePath, error) {
 
-	if !strings.HasSuffix(path, "/") {
-		return errors.New("downloadFiles: path must be GCS directory")
-	}
-
-	// Make directory is required
-	os.MkdirAll(localDest, 0755)
-
-	// List all file in bucket
+	var ret []filePath
 	it := bucket.Objects(ctx, &storage.Query{Prefix: path})
 	for {
 		attrs, err := it.Next()
@@ -459,52 +404,56 @@ func downloadFiles(ctx context.Context, bucket *storage.BucketHandle, path strin
 			break
 		}
 		if err != nil {
-			return err
+			return []filePath{}, err
 		}
 
-		n := attrs.Name[len(path):]
-		if n == "" {
-			// Root path of the bucket filter path
+		n := attrs.Name[strings.LastIndex(path, "/")+1:]
+		if n == "" || strings.HasSuffix(n, "/") {
+			// Root path or directory of the bucket filter path
 			continue
 		}
-		if strings.HasSuffix(n, "/") {
-			//it's a directory, loop on it
-			err = downloadFiles(ctx, bucket, attrs.Name, localDest+n)
-			if err != nil {
-				return err
-			}
-		} else {
-			err = downloadFile(ctx, bucket, attrs.Name, localDest+n)
-			if err != nil {
-				return err
-			}
-		}
+		ret = append(ret, filePath{
+			RelativePath: n[:strings.LastIndex(n, "/")+1],
+			FileName:     n[strings.LastIndex(n, "/")+1:],
+		})
 	}
-	return nil
+	return ret, nil
 }
 
-//Download a single file from storage to the localDest. The path must represent a GCS file
-func downloadFile(ctx context.Context, bucket *storage.BucketHandle, path string, dest string) error {
-	if strings.HasSuffix(path, "/") {
-		return errors.New("downloadFiles: path must be GCS file")
+//Download files from storage to the localDest. If there is subdirectory into GCS path, a loop is performed for getting
+//subdirectories
+//The path must represent a GCS directory (prefix)
+func downloadFiles(ctx context.Context, bucket *storage.BucketHandle, path string, localDest string) error {
+	if !strings.HasSuffix(path, "/") {
+		return errors.New("downloadFiles: path must be GCS directory")
 	}
 
-	//Copy each file in the dest directory
-	src, err := bucket.Object(path).NewReader(ctx)
+	list, err := listGcsFiles(ctx, bucket, path)
 	if err != nil {
 		return err
 	}
-	defer src.Close()
 
-	destination, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer destination.Close()
+	for _, l := range list {
+		// Make directory is required
+		os.MkdirAll(localDest+l.RelativePath, 0755)
 
-	_, err = io.Copy(destination, src)
-	if err != nil {
-		return err
+		//Copy each file in the dest directory
+		src, err := bucket.Object(path + l.RelativePath + l.FileName).NewReader(ctx)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+
+		destination, err := os.Create(localDest + l.RelativePath + l.FileName)
+		if err != nil {
+			return err
+		}
+		defer destination.Close()
+
+		_, err = io.Copy(destination, src)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
