@@ -5,6 +5,9 @@ The container is designed for running on Cloud Run, but can be deployed anywhere
 
 With only one deployment, you can perform batch prediction on dynamically loaded model. 
 
+*Related [Medium article](https://medium.com/google-cloud/on-demand-small-batch-predictions-with-cloud-run-and-embedded-tf-469242d66c3b
+)*
+
 ## Internal steps
 
 The container exposes a web server which, on each request:
